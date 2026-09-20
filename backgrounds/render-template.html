@@ -1,0 +1,403 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden}
+  canvas{display:block;width:1920px;height:1080px}
+</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+const DAY_URI = "data:image/jpeg;base64,__DAY_B64__";
+const NIGHT_URI = "data:image/jpeg;base64,__NIGHT_B64__";
+const FPS = 24;
+const DURATION = 30; // seconds for one full 360鎺?rotation (seamless loop)
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: true, premultipliedAlpha: false });
+if (!gl) { document.body.innerHTML = '<h1>No WebGL2</h1>'; throw new Error('no webgl2'); }
+
+// ---------- shaders ----------
+const VS_BG = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aPos;
+uniform mat4 uInvProj;
+uniform mat4 uInvView;
+out vec3 vRay;
+void main(){
+  vec4 clip = vec4(aPos, 1.0, 1.0);
+  vec4 view = uInvProj * clip;
+  vRay = mat3(uInvView) * view.xyz;
+  gl_Position = clip;
+}`;
+
+const FS_BG = `#version 300 es
+precision highp float;
+in vec3 vRay;
+out vec4 fragColor;
+float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main(){
+  vec3 rd = normalize(vRay);
+  vec3 col = mix(vec3(0.001,0.002,0.006), vec3(0.02,0.03,0.07), clamp(rd.y*0.5+0.5, 0.0, 1.0));
+  float band = exp(-pow(abs(rd.y*0.85+0.08)*6.0, 2.0));
+  col += vec3(0.012,0.014,0.020) * band;
+  vec2 sp = vec2(atan(rd.z, rd.x), asin(clamp(rd.y,-1.0,1.0)));
+  vec2 cell = floor(sp * vec2(220.0, 110.0));
+  float h = hash12(cell);
+  float star = 0.0;
+  if (h > 0.985) {
+    float bright = pow(fract(h * 13.37), 24.0);
+    vec2 fpos = fract(sp * vec2(220.0, 110.0)) - 0.5;
+    float d = length(fpos);
+    star = smoothstep(0.12, 0.0, d) * bright;
+  }
+  float twinkle = 0.75 + 0.25 * sin(sp.x * 700.0 + cell.y * 3.0);
+  vec3 starCol = mix(vec3(0.6,0.7,1.0), vec3(1.0,0.95,0.85), hash12(cell+7.7));
+  col += starCol * star * twinkle * 1.6;
+  float h2 = hash12(cell + 31.7);
+  if (h2 > 0.999) {
+    vec2 fpos = fract(sp * vec2(220.0, 110.0)) - 0.5;
+    float d = length(fpos);
+    col += mix(vec3(1.0,0.4,0.3), vec3(0.4,0.6,1.0), step(0.5, h2)) * smoothstep(0.05, 0.0, d) * 2.0;
+  }
+  fragColor = vec4(col, 1.0);
+}`;
+
+const VS_EARTH = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec2 aUV;
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform mat4 uModel;
+out vec2 vUV;
+out vec3 vNormal;
+out vec3 vWorldPos;
+void main(){
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  vWorldPos = wp.xyz;
+  vNormal = mat3(uModel) * aPos;
+  vUV = aUV;
+  gl_Position = uProj * uView * wp;
+}`;
+
+const FS_EARTH = `#version 300 es
+precision highp float;
+in vec2 vUV;
+in vec3 vNormal;
+in vec3 vWorldPos;
+uniform sampler2D uDay;
+uniform sampler2D uNight;
+uniform vec3 uSunDir;
+uniform vec3 uCamPos;
+uniform float uTime;
+uniform float uDebug;
+out vec4 fragColor;
+void main(){
+  if (uDebug > 0.5) { fragColor = vec4(1.0, 0.0, 0.0, 1.0); return; }
+  vec3 n = normalize(vNormal);
+  vec3 v = normalize(uCamPos - vWorldPos);
+  vec3 sun = normalize(uSunDir);
+  float ndl = dot(n, sun);
+  vec3 dayCol = texture(uDay, vUV).rgb;
+  vec3 nightCol = texture(uNight, vUV).rgb;
+  float dayK = smoothstep(-0.12, 0.28, ndl);
+  vec3 litDay = dayCol * (0.075 + 0.925 * max(ndl, 0.0));
+  float nightK = 1.0 - smoothstep(-0.05, 0.16, ndl);
+  vec3 lights = nightCol * nightK * 1.7;
+  float haze = exp(-abs(ndl) * 16.0) * 0.3;
+  vec3 col = litDay + lights + vec3(0.35, 0.25, 0.15) * haze;
+  float ndv = max(dot(n, v), 0.0);
+  col *= mix(0.92, 1.0, pow(ndv, 0.6));
+  float fres = pow(1.0 - ndv, 4.0);
+  col += vec3(0.22, 0.42, 0.85) * fres * 0.75;
+  col += vec3(0.004, 0.010, 0.030) * nightK;
+  fragColor = vec4(col, 1.0);
+}`;
+
+const VS_HALO = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uProj;
+uniform mat4 uView;
+uniform mat4 uModel;
+out vec3 vNormal;
+out vec3 vWorldPos;
+void main(){
+  vec4 wp = uModel * vec4(aPos, 1.0);
+  vWorldPos = wp.xyz;
+  vNormal = mat3(uModel) * aPos;
+  gl_Position = uProj * uView * wp;
+}`;
+
+const FS_HALO = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorldPos;
+uniform vec3 uCamPos;
+out vec4 fragColor;
+void main(){
+  vec3 n = normalize(vNormal);
+  vec3 v = normalize(uCamPos - vWorldPos);
+  float fres = pow(1.0 - max(dot(v, n), 0.0), 2.4);
+  vec3 atm = vec3(0.30, 0.55, 1.0) * fres;
+  fragColor = vec4(atm, fres * 0.85);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    throw new Error('shader compile failed');
+  }
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link failed');
+  return p;
+}
+
+const progBG = program(VS_BG, FS_BG);
+const progEarth = program(VS_EARTH, FS_EARTH);
+const progHalo = program(VS_HALO, FS_HALO);
+
+// ---------- geometry ----------
+function makeSphere(radius, latSeg, longSeg) {
+  const pos = [], uv = [];
+  function addVertex(i, j) {
+    const theta = (i / latSeg) * Math.PI;
+    const phi = (j / longSeg) * Math.PI * 2;
+    const x = -radius * Math.cos(phi) * Math.sin(theta);
+    const y = radius * Math.cos(theta);
+    const z = radius * Math.sin(phi) * Math.sin(theta);
+    pos.push(x, y, z);
+    uv.push(1.0 - j / longSeg, 1.0 - i / latSeg);
+  }
+  for (let i = 0; i < latSeg; i++) {
+    for (let j = 0; j < longSeg; j++) {
+      addVertex(i, j); addVertex(i + 1, j); addVertex(i + 1, j + 1);
+      addVertex(i, j); addVertex(i + 1, j + 1); addVertex(i, j + 1);
+    }
+  }
+  return { pos: new Float32Array(pos), uv: new Float32Array(uv), count: pos.length / 3 };
+}
+
+const earth = makeSphere(1.0, 128, 256);
+const halo = makeSphere(1.028, 64, 128);
+
+function makeVao(prog, posArr, uvArr) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const bp = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bp);
+  gl.bufferData(gl.ARRAY_BUFFER, posArr, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  if (uvArr) {
+    const bu = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, bu);
+    gl.bufferData(gl.ARRAY_BUFFER, uvArr, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+  }
+  gl.bindVertexArray(null);
+  return vao;
+}
+const earthVao = makeVao(progEarth, earth.pos, earth.uv);
+const haloVao = makeVao(progHalo, halo.pos, null);
+const earthVertCount = earth.count;
+const haloVertCount = halo.count;
+
+const quadVao = gl.createVertexArray();
+{
+  gl.bindVertexArray(quadVao);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+}
+
+// ---------- textures ----------
+function loadTexture(uri) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, img);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      resolve(t);
+    };
+    img.onerror = reject;
+    img.src = uri;
+  });
+}
+
+// ---------- matrices ----------
+function mat4Identity() { const m = new Float32Array(16); m[0]=m[5]=m[10]=m[15]=1; return m; }
+function mat4Multiply(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    o[c*4+r] = a[r]*b[c*4] + a[4+r]*b[c*4+1] + a[8+r]*b[c*4+2] + a[12+r]*b[c*4+3];
+  }
+  return o;
+}
+function mat4Perspective(fovY, aspect, near, far) {
+  const f = 1 / Math.tan(fovY / 2), nf = 1 / (near - far);
+  const m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f; m[10] = (far + near) * nf; m[11] = -1;
+  m[14] = 2 * far * near * nf;
+  return m;
+}
+function mat4LookAt(eye, center, up) {
+  const z = norm(sub(eye, center)), x = norm(cross(up, z)), y = cross(z, x);
+  const m = new Float32Array(16);
+  m[0]=x[0]; m[4]=x[1]; m[8]=x[2]; m[12]=-dot(x,eye);
+  m[1]=y[0]; m[5]=y[1]; m[9]=y[2]; m[13]=-dot(y,eye);
+  m[2]=z[0]; m[6]=z[1]; m[10]=z[2]; m[14]=-dot(z,eye);
+  m[15]=1;
+  return m;
+}
+function mat4Inverse(m) {
+  const o = new Float32Array(16);
+  const inv = new Float32Array(16);
+  inv[0]=m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
+  inv[4]=-m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
+  inv[8]=m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
+  inv[12]=-m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
+  inv[1]=-m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
+  inv[5]=m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
+  inv[9]=-m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
+  inv[13]=m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
+  inv[2]=m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
+  inv[6]=-m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
+  inv[10]=m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
+  inv[14]=-m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
+  inv[3]=-m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
+  inv[7]=m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
+  inv[11]=-m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
+  inv[15]=m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
+  let det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
+  if (det === 0) return m;
+  det = 1/det;
+  for (let i = 0; i < 16; i++) o[i] = inv[i] * det;
+  return o;
+}
+function sub(a, b) { return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]; }
+function cross(a, b) { return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }
+function dot(a, b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+function norm(a) { const l = Math.hypot(a[0],a[1],a[2]); return [a[0]/l, a[1]/l, a[2]/l]; }
+function mat4AxisAngle(axis, angle) {
+  const [x, y, z] = norm(axis);
+  const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+  const m = new Float32Array(16);
+  m[0]=t*x*x+c;   m[4]=t*x*y-s*z; m[8]=t*x*z+s*y;  m[12]=0;
+  m[1]=t*x*y+s*z; m[5]=t*y*y+c;   m[9]=t*y*z-s*x;  m[13]=0;
+  m[2]=t*x*z-s*y; m[6]=t*y*z+s*x; m[10]=t*z*z+c;   m[14]=0;
+  m[3]=0; m[7]=0; m[11]=0; m[15]=1;
+  return m;
+}
+
+// ---------- scene ----------
+const PROJ = mat4Perspective(40 * Math.PI / 180, 1920 / 1080, 0.01, 100);
+const EYE = [0, 0.55, 3.6];
+const VIEW = mat4LookAt(EYE, [0, 0, 0], [0, 1, 0]);
+const INV_VIEW = mat4Inverse(VIEW);
+const INV_PROJ = mat4Inverse(PROJ);
+const SUN = norm([0.9, 0.22, -0.42]);
+const TILT_AXIS = norm([0, Math.sin(23.4*Math.PI/180), Math.cos(23.4*Math.PI/180)]);
+
+gl.enable(gl.DEPTH_TEST);
+gl.depthFunc(gl.LEQUAL);
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+gl.viewport(0, 0, 1920, 1080);
+
+let dayTex, nightTex;
+
+function renderFrame(t) {
+  const angle = (t / DURATION) * Math.PI * 2;
+  const MODEL = mat4AxisAngle(TILT_AXIS, angle);
+  const errs = [];
+
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  errs.push('clear:' + gl.getError());
+
+  gl.depthMask(false);
+  gl.useProgram(progBG);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progBG, 'uInvProj'), false, INV_PROJ);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progBG, 'uInvView'), false, INV_VIEW);
+  gl.bindVertexArray(quadVao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  errs.push('bg:' + gl.getError());
+
+  gl.useProgram(progHalo);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progHalo, 'uProj'), false, PROJ);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progHalo, 'uView'), false, VIEW);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progHalo, 'uModel'), false, MODEL);
+  gl.uniform3fv(gl.getUniformLocation(progHalo, 'uCamPos'), EYE);
+  gl.bindVertexArray(haloVao);
+  gl.drawArrays(gl.TRIANGLES, 0, haloVertCount);
+  errs.push('halo:' + gl.getError());
+
+  gl.depthMask(true);
+  gl.useProgram(progEarth);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progEarth, 'uProj'), false, PROJ);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progEarth, 'uView'), false, VIEW);
+  gl.uniformMatrix4fv(gl.getUniformLocation(progEarth, 'uModel'), false, MODEL);
+  gl.uniform3fv(gl.getUniformLocation(progEarth, 'uSunDir'), SUN);
+  gl.uniform3fv(gl.getUniformLocation(progEarth, 'uCamPos'), EYE);
+  gl.uniform1f(gl.getUniformLocation(progEarth, 'uTime'), t);
+  gl.uniform1f(gl.getUniformLocation(progEarth, 'uDebug'), window.__debugEarth ? 1.0 : 0.0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, dayTex);
+  gl.uniform1i(gl.getUniformLocation(progEarth, 'uDay'), 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, nightTex);
+  gl.uniform1i(gl.getUniformLocation(progEarth, 'uNight'), 1);
+  gl.bindVertexArray(earthVao);
+  gl.drawArrays(gl.TRIANGLES, 0, earthVertCount);
+  errs.push('earth:' + gl.getError());
+  gl.bindVertexArray(null);
+  window.__lastErrors = errs;
+}
+
+window.__matDump = function () {
+  const hasNaN = (a) => a.some(v => Number.isNaN(v) || !Number.isFinite(v));
+  return {
+    projNaN: hasNaN(Array.from(PROJ)),
+    viewNaN: hasNaN(Array.from(VIEW)),
+    invViewNaN: hasNaN(Array.from(INV_VIEW)),
+    invProjNaN: hasNaN(Array.from(INV_PROJ)),
+    proj: Array.from(PROJ).map(v => +v.toFixed(4)),
+    view: Array.from(VIEW).map(v => +v.toFixed(4))
+  };
+};
+
+window.__renderFrame = renderFrame;
+window.__ready = false;
+Promise.all([loadTexture(DAY_URI), loadTexture(NIGHT_URI)]).then(([d, n]) => {
+  dayTex = d; nightTex = n;
+  window.__ready = true;
+  renderFrame(0);
+});
+</script>
+</body>
+</html>

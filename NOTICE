@@ -1,0 +1,43 @@
+# NOTICE
+
+本仓库是一个非官方 fork，包含两部分来源不同的内容。
+
+## 1. 插件代码 —— 上游作品
+
+来自 [LAN-TINA-WS/dsh-gui-customization](https://github.com/LAN-TINA-WS/dsh-gui-customization)，
+对应 npm 包 `dsh-gui-customization@0.6.4`（维护者 `lantianws <206418838@qq.com>`）。
+
+- 版权：Copyright (c) 2026 LAN-TINA-WS
+- 许可：MIT（原文见 `LICENSE`，按 MIT 要求原样保留，未修改）
+- 本仓库对其**未做任何修改**：`lib/`、`assets/backgrounds/`、`cordis.patch.yml`、`package.json`
+  与上游 npm tarball 逐文件 SHA256 一致。
+
+## 2. `backgrounds/` —— 本 fork 新增
+
+| 文件 | 来源 | 说明 |
+|---|---|---|
+| `render-template.html` | 本 fork 作者自写 | WebGL2 + GLSL 地球日夜渲染器，1920×1080 / 24 FPS / 30 秒无缝 360° 循环 |
+| `make-render.js` | 本 fork 作者自写 | 把两张贴图 base64 注入模板，产出单文件 `render.html` |
+| `earth-day.jpg` | NASA | 经 NASA Images API（`images-api.nasa.gov`）取得的对地观测影像 |
+| `earth-night.jpg` | NASA | 同上（夜间灯光影像） |
+
+### NASA 素材说明
+
+NASA 素材一般**不受版权保护**，可自由使用，但需遵守 [NASA 媒体使用指南](https://www.nasa.gov/nasa-brand-center/images-and-media/)：
+
+- 应注明素材来自 NASA；
+- **不得**暗示 NASA 认可、背书或与本项目存在关联；
+- **不得**使用 NASA 的标志、徽标或标识（insignia）。
+
+本项目与 NASA **无任何关联**，未获其背书。
+
+### 未包含的内容
+
+仓库**不包含**以下内容，以控制体积并避免版权与隐私风险：
+
+- 大量中间探针帧（`probes2/*.png`，单张 5–13 MB，合计约 349 MB）
+- 由 NASA 视频抽帧得到的 ISS 序列帧（`frames/iss1080_*.png`）
+- 测试用视频（`4k-seek-test.mp4`，33 MB）
+- 调研期间从其他仓库抓取的第三方 README（如 `youzhoujiMrLiu/dsh-ui-wallpaper`、
+  `leavestring/awesome-dsh-background-plugin`、`wangkaxds/dsh-aurora-wallpaper` 等）
+- ffmpeg 二进制（来自 `gyan.dev` 的官方构建）
